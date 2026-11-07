@@ -1,0 +1,234 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1f2328; --muted: #6b7280; --line: #e5e7eb;
+    --accent: #5b5bd6; --accent-fg: #ffffff; --ok: #15803d; --bad: #b91c1c; --soft: #f5f5ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 14px; font: 12px/1.45 Inter, system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  header b { font-size: 14px; }
+  .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--line); color: var(--muted); }
+  .pill.ok { background: #dcfce7; color: var(--ok); }
+  .pill.bad { background: #fee2e2; color: var(--bad); }
+  .card { border: 1px solid var(--line); border-radius: 10px; padding: 10px; margin-bottom: 10px; }
+  .label { font-size: 11px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
+  #sel div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 4px 0; }
+  input[type=text], input[type=number], select { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; }
+  input[type=number] { width: 90px; }
+  input[type=text] { width: 170px; }
+  button { width: 100%; padding: 10px; border: 0; border-radius: 10px; font: inherit; font-weight: 600;
+           background: var(--accent); color: var(--accent-fg); cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #log { margin-top: 10px; max-height: 150px; overflow: auto; font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+  #log div { padding: 2px 0; border-bottom: 1px dashed var(--line); word-break: break-word; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+  <header><b>Figma Lens</b><span id="bridge" class="pill">checking…</span></header>
+
+  <div class="card">
+    <div class="label">Selection</div>
+    <div id="sel" class="muted">Select one or more frames</div>
+  </div>
+
+  <div class="card">
+    <div class="row"><span>Preview quality</span>
+      <select id="scale"><option value="1">1x</option><option value="2" selected>2x</option><option value="3">3x</option></select>
+    </div>
+    <div class="row"><label><input type="checkbox" id="css" checked /> Include CSS per layer</label></div>
+    <div class="row"><label><input type="checkbox" id="sections" checked /> Section crops</label></div>
+    <div class="row" title="Stop reading after this many layers (0 = no limit). Skipped layers are listed in spec.md."><span>Max layers</span><input type="number" id="maxLayers" min="0" step="1000" value="0" /></div>
+    <div class="row" title="Fetch Figma's CSS for at most this many styled layers (0 = all). CSS is slow and mostly repeats the spec."><span>CSS limit</span><input type="number" id="cssLimit" min="0" step="500" value="3000" /></div>
+    <div class="row"><span>Bridge</span><input type="text" id="url" value="http://localhost:4141" /></div>
+  </div>
+
+  <button id="go" disabled>Export to Claude</button>
+  <div id="log"></div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  let hasSelection = false;
+  let busy = false;
+  let queue = Promise.resolve();
+
+  function log(text, cls) {
+    const d = document.createElement('div');
+    d.textContent = text;
+    if (cls) d.className = cls;
+    $('log').prepend(d);
+  }
+  function base() { return $('url').value.trim().replace(/\/+$/, ''); }
+  function refreshButton() { $('go').disabled = busy || !hasSelection; }
+
+  async function ping() {
+    try {
+      const r = await fetch(base() + '/health');
+      const j = await r.json();
+      if (!j.ok) throw new Error('bad reply');
+      $('bridge').textContent = 'bridge on';
+      $('bridge').className = 'pill ok';
+      $('bridge').title = 'Writing to ' + j.outRoot;
+    } catch (e) {
+      $('bridge').textContent = 'bridge off';
+      $('bridge').className = 'pill bad';
+      $('bridge').title = 'Run: npm run bridge';
+    }
+  }
+  ping();
+  setInterval(ping, 4000);
+
+  function toBase64(bytes) {
+    let s = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      s += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(s);
+  }
+
+  async function postJson(url, obj) {
+    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: obj === undefined ? undefined : JSON.stringify(obj) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) {
+      const e = new Error(j.error || 'HTTP ' + r.status);
+      e.status = r.status;
+      throw e;
+    }
+    return j;
+  }
+
+  // At most UPLOADS files in flight; each retried a few times (a hiccup costs one file, not the export).
+  const UPLOADS = 4;
+  let inFlight = 0;
+  const waiting = [];
+  async function slot(fn) {
+    if (inFlight >= UPLOADS) await new Promise((r) => waiting.push(r));
+    inFlight++;
+    try { return await fn(); } finally { inFlight--; if (waiting.length) waiting.shift()(); }
+  }
+  async function uploadFile(id, f) {
+    let last;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const r = await fetch(base() + '/exports/' + id + '/files?path=' + encodeURIComponent(f.path), {
+          method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: f.bytes,
+        });
+        const j = await r.json().catch(() => ({}));
+        if (r.ok && j.ok) return;
+        last = new Error(f.path + ': ' + (j.error || 'HTTP ' + r.status));
+        last.status = r.status;
+        if (r.status >= 400 && r.status < 500) break; // the bridge said no; retrying won't help
+      } catch (e) {
+        last = e;
+      }
+      await new Promise((r) => setTimeout(r, 300 * attempt));
+    }
+    throw last;
+  }
+
+  // One entry per frame being exported. Files are uploaded as they arrive from the plugin.
+  // Old bridges (no /exports) get everything in one request at the end, like before.
+  const jobs = new Map();
+  function job(exportId) {
+    let j = jobs.get(exportId);
+    if (!j) {
+      j = { files: [], uploads: [], session: postJson(base() + '/exports').then((r) => r.id, (e) => (e.status === 404 ? null : Promise.reject(e))) };
+      j.session.catch(() => {}); // reported when the export finishes
+      jobs.set(exportId, j);
+    }
+    return j;
+  }
+  function addFile(exportId, f) {
+    const j = job(exportId);
+    j.files.push(f);
+    // On the streamed path the bytes are not kept once uploaded; old bridges need them at the end.
+    const up = j.session.then((id) => (id ? slot(() => uploadFile(id, f)).then(() => { f.bytes = null; }) : null));
+    up.catch(() => {});
+    j.uploads.push(up);
+  }
+  function drop(exportId) {
+    const j = jobs.get(exportId);
+    jobs.delete(exportId);
+    if (j) j.session.then((id) => id && postJson(base() + '/exports/' + id + '/abort')).catch(() => {});
+  }
+
+  async function finish(exportId, p) {
+    const j = job(exportId);
+    jobs.delete(exportId);
+    const name = p.meta.nodeName;
+    try {
+      const id = await j.session;
+      let res;
+      if (id) {
+        log('Uploading "' + name + '" (' + j.files.length + ' files)…', 'muted');
+        try {
+          await Promise.all(j.uploads);
+        } catch (e) {
+          postJson(base() + '/exports/' + id + '/abort').catch(() => {});
+          throw e;
+        }
+        res = await postJson(base() + '/exports/' + id + '/finish', { meta: p.meta, spec: p.spec, tokens: p.tokens, files: p.files.map((f) => f.path) });
+      } else {
+        log('Sending "' + name + '" (' + j.files.length + ' files, older bridge: one request)…', 'muted');
+        res = await postJson(base() + '/export', {
+          meta: p.meta, spec: p.spec, tokens: p.tokens,
+          files: j.files.map((f) => ({ path: f.path, base64: toBase64(f.bytes) })),
+        });
+      }
+      log('✔ ' + name + ' → ' + res.dir + ' (' + res.files + ' files)', 'ok');
+      if (p.meta.warnings.length) log(p.meta.warnings.length + ' warning(s) — listed in spec.md', 'muted');
+      if (p.meta.truncated) log('Layer limit reached: ' + (p.meta.skippedCount || 'some') + ' layer(s) left out — listed in spec.md', 'bad');
+    } catch (e) {
+      log('✖ ' + name + ': ' + e.message + (e.status ? '' : ' — is the bridge running? (npm run bridge)'), 'bad');
+    }
+  }
+
+  onmessage = (ev) => {
+    const m = ev.data && ev.data.pluginMessage;
+    if (!m) return;
+    if (m.type === 'selection') {
+      hasSelection = m.items.length > 0;
+      $('sel').innerHTML = '';
+      if (!hasSelection) { $('sel').textContent = 'Select one or more frames'; $('sel').className = 'muted'; }
+      else {
+        $('sel').className = '';
+        m.items.forEach((it) => {
+          const d = document.createElement('div');
+          d.textContent = it.name + ' · ' + it.type + ' · ' + it.w + '×' + it.h;
+          $('sel').appendChild(d);
+        });
+      }
+      refreshButton();
+    } else if (m.type === 'progress') {
+      log(m.text, 'muted');
+    } else if (m.type === 'error') {
+      log('✖ ' + m.message, 'bad');
+      if (m.exportId) drop(m.exportId);
+    } else if (m.type === 'begin') {
+      job(m.exportId);
+    } else if (m.type === 'file') {
+      addFile(m.exportId, { path: m.path, bytes: m.bytes });
+    } else if (m.type === 'payload') {
+      queue = queue.then(() => finish(m.exportId, m.payload));
+    } else if (m.type === 'done-reading') {
+      queue = queue.then(() => { busy = false; refreshButton(); });
+    }
+  };
+
+  $('go').onclick = () => {
+    busy = true;
+    refreshButton();
+    parent.postMessage({ pluginMessage: { type: 'export', options: {
+      scale: Number($('scale').value), css: $('css').checked, sections: $('sections').checked,
+      maxLayers: Number($('maxLayers').value), cssLimit: Number($('cssLimit').value),
+    } } }, '*');
+  };
+</script>
+</body>
+</html>
